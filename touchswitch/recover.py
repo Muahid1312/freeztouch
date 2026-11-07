@@ -12,6 +12,11 @@ def main():
     if os.geteuid() == 0:
         parser.error('Run as your normal desktop user, without sudo.')
     backend = Backend()
+    if backend.session.kind == 'wayland':
+        print("Wayland: close TouchSwitch or use Enable touchscreen to release its grab.\n"
+              "Emergency release (only TouchSwitch helpers):\n"
+              "sudo /usr/bin/pkill -TERM -f '^/usr/bin/python3 -I /usr/libexec/touchswitch-helper '")
+        return 0
     try:
         devices = backend.discover()
         if not args.node:

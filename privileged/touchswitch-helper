@@ -1,0 +1,303 @@
+#!/usr/bin/python3 -I
+"""Root-only, pipe-bound EVIOCGRAB owner. Standalone; no checkout imports."""
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import platform
+from pathlib import Path
+import re
+import select
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+HELPER = '/usr/libexec/touchswitch-helper'
+EVIOCGRAB = 0x40044590  # _IOW('E', 0x90, int), Linux asm-generic ABI.
+REJECT = ('MOUSE', 'TOUCHPAD', 'KEYBOARD', 'TABLET', 'TABLET_PAD',
+          'JOYSTICK', 'POINTINGSTICK', 'ACCELEROMETER', 'SWITCH')
+ALLOWED_TOUCH_KEYS = {325, 328, 330, 333, 334, 335}  # Finger/tool-count/touch only.
+
+
+class UnsafeDevice(RuntimeError):
+    pass
+
+
+def token_for(syspath, name):
+    return hashlib.sha256((syspath + '\0' + name).encode()).hexdigest()
+
+
+def trusted_file(path):
+    """Check the executable and every parent; never execute user-writable code as root."""
+    path = Path(path)
+    for item in (path, *path.parents):
+        info = item.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise UnsafeDevice(f'Unsafe root installation: {item}')
+
+
+def udev_properties(syspath):
+    result = subprocess.run(['/usr/bin/udevadm', 'info', '--query=property', '--path', syspath],
+                            capture_output=True, text=True, timeout=3,
+                            env={'PATH': '/usr/sbin:/usr/bin', 'LC_ALL': 'C'})
+    if result.returncode:
+        raise UnsafeDevice('udev could not verify the selected input device.')
+    return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+
+
+def validate_udev(props, node, seat):
+    if props.get('DEVNAME') != node or props.get('ID_INPUT_TOUCHSCREEN') != '1':
+        raise UnsafeDevice('Device is not a udev-classified touchscreen.')
+    if any(props.get('ID_INPUT_' + kind) == '1' for kind in REJECT):
+        raise UnsafeDevice('Mixed or unrelated input device rejected.')
+    if props.get('ID_SEAT', 'seat0') != seat:
+        raise UnsafeDevice('Touchscreen belongs to a different desktop seat.')
+
+
+def read_bits(fd, number, size):
+    data = bytearray(size)
+    request = (2 << 30) | (size << 16) | (ord('E') << 8) | number
+    fcntl.ioctl(fd, request, data, True)
+    return {i for i in range(size * 8) if data[i // 8] & (1 << (i % 8))}
+
+
+def validate_capabilities(events, keys, axes, props):
+    # EV_SYN/EV_KEY/EV_ABS/EV_MSC only. No relative motion, switches or force feedback.
+    if not {0, 3} <= events or not events <= {0, 1, 3, 4}:
+        raise UnsafeDevice('Unexpected input event types; refusing to isolate a mixed device.')
+    if not keys <= ALLOWED_TOUCH_KEYS:
+        raise UnsafeDevice('Keyboard, mouse, pen or unrelated button capabilities rejected.')
+    if 1 not in props or 0 in props:  # INPUT_PROP_DIRECT, no INPUT_PROP_POINTER.
+        raise UnsafeDevice('Only direct touchscreens are supported, not touchpads or tablets.')
+    if not ({0x35, 0x36} <= axes or {0, 1} <= axes):
+        raise UnsafeDevice('Touchscreen lacks absolute X/Y touch axes.')
+    # Permit only absolute coordinates and common multitouch/pressure parameters.
+    if not axes <= {0, 1, 0x18, 0x19, 0x1a, 0x1b, *range(0x2f, 0x3e)}:
+        raise UnsafeDevice('Unrelated absolute input axes rejected.')
+
+
+def open_verified(token, seat, root=Path('/sys/class/input')):
+    if not re.fullmatch('[0-9a-f]{64}', token):
+        raise UnsafeDevice('Invalid touchscreen identity token.')
+    candidates = []
+    for entry in root.glob('event*'):
+        if not re.fullmatch(r'event[0-9]+', entry.name):
+            continue
+        try:
+            syspath = str(entry.resolve(strict=True))
+            name = (entry / 'device/name').read_text().strip()
+            if token_for(syspath, name) == token:
+                candidates.append((entry, syspath, name))
+        except OSError:
+            continue
+    if len(candidates) != 1:
+        raise UnsafeDevice('Touchscreen identity changed or disconnected. Refresh the device selector.')
+    entry, syspath, name = candidates[0]
+    node = '/dev/input/' + entry.name  # Constructed solely from the kernel enumeration.
+    validate_udev(udev_properties(syspath), node, seat)
+    fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISCHR(info.st_mode):
+            raise UnsafeDevice('Input node is not a character device.')
+        expected = ':'.join((str(os.major(info.st_rdev)), str(os.minor(info.st_rdev))))
+        if (entry / 'dev').read_text().strip() != expected:
+            raise UnsafeDevice('Input node identity changed while opening.')
+        if str(Path('/sys/dev/char', expected).resolve(strict=True)) != syspath:
+            raise UnsafeDevice('Opened device does not match its sysfs identity.')
+        # Recheck after opening, including node/name/udev identity against hotplug races.
+        if str(entry.resolve(strict=True)) != syspath or (entry / 'device/name').read_text().strip() != name:
+            raise UnsafeDevice('Touchscreen changed while opening.')
+        validate_udev(udev_properties(syspath), node, seat)
+        validate_capabilities(read_bits(fd, 0x20, 8), read_bits(fd, 0x21, 96),
+                              read_bits(fd, 0x23, 8), read_bits(fd, 0x09, 8))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class SessionGuard:
+    """Pin caller PID and verify its uid, logind session, seat and active state."""
+    def __init__(self, uid, pid):
+        self.pidfd = os.pidfd_open(pid)
+        try:
+            if os.stat(f'/proc/{pid}').st_uid != uid:
+                raise UnsafeDevice('GUI process does not belong to the polkit caller.')
+            self.lib = ctypes.CDLL('libsystemd.so.0')
+            self.lib.sd_pid_get_session.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+            self.lib.sd_uid_get_display.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+            self.lib.sd_session_get_uid.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint)]
+            for name in ('sd_session_get_type', 'sd_session_get_seat'):
+                getattr(self.lib, name).argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+            self.lib.sd_session_is_active.argtypes = [ctypes.c_char_p]
+            try:
+                self.session = self.text('sd_pid_get_session', pid).encode()
+            except UnsafeDevice:
+                # GNOME can launch apps in user-manager scopes, outside a session cgroup.
+                # Resolve that uid's graphical session from logind, never from caller strings.
+                self.session = self.text('sd_uid_get_display', uid).encode()
+            owner = ctypes.c_uint()
+            if self.lib.sd_session_get_uid(self.session, ctypes.byref(owner)) < 0 or owner.value != uid:
+                raise UnsafeDevice('Could not authenticate the GUI desktop session.')
+            if self.text('sd_session_get_type', self.session) != 'wayland':
+                raise UnsafeDevice('This helper is restricted to a Wayland desktop session.')
+            self.seat = self.text('sd_session_get_seat', self.session)
+            if not self.alive():
+                raise UnsafeDevice('The GUI must belong to an active local desktop session.')
+        except BaseException:
+            os.close(self.pidfd)
+            raise
+
+    def text(self, method, arg):
+        value = ctypes.c_void_p()
+        if getattr(self.lib, method)(arg, ctypes.byref(value)) < 0:
+            raise UnsafeDevice('Required logind session information is unavailable.')
+        try:
+            return ctypes.string_at(value).decode()
+        finally:
+            libc = ctypes.CDLL(None)
+            libc.free.argtypes = [ctypes.c_void_p]
+            libc.free(value)
+
+    def alive(self):
+        return (not select.select([self.pidfd], [], [], 0)[0]
+                and self.lib.sd_session_is_active(self.session) > 0)
+
+    def close(self):
+        os.close(self.pidfd)
+
+
+def boottime():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def emit(message):
+    # No unbounded blocking if the GUI stops reading: failure releases the grab.
+    os.write(1, (json.dumps(message) + '\n').encode())
+
+
+def own_grab(fd, guard, send=emit, clock=boottime, poll=select.select,
+             read=os.read, ioctl=fcntl.ioctl, close=os.close):
+    """Only this function owns the fd. Every path closes it, even a failed grab."""
+    grabbed = False
+    reason = 'released'
+    try:
+        if not guard.alive():
+            raise UnsafeDevice('GUI session is no longer active.')
+        ioctl(fd, EVIOCGRAB, 1)
+        grabbed = True
+        now = clock()
+        trial_deadline, heartbeat = now + 15, now + 4
+        previous_boot, previous_mono = now, time.monotonic()
+        send({'event': 'disabled', 'seconds': 15})
+        pending = b''
+        while True:
+            now, mono = clock(), time.monotonic()
+            if now - previous_boot - (mono - previous_mono) > 1:
+                reason = 'suspend/resume detected'
+                break
+            previous_boot, previous_mono = now, mono
+            if now >= heartbeat or (trial_deadline is not None and now >= trial_deadline):
+                reason = 'connection heartbeat lost' if now >= heartbeat else '15-second trial expired'
+                break
+            if not guard.alive():
+                reason = 'GUI exited or desktop session ended/became inactive'
+                break
+            ready, _, _ = poll([0, fd, guard.pidfd], [], [], min(.5, heartbeat - now,
+                                       trial_deadline - now if trial_deadline is not None else .5))
+            if guard.pidfd in ready:
+                reason = 'GUI exited'
+                break
+            if 0 in ready:
+                chunk = read(0, 128)
+                if not chunk:
+                    reason = 'GUI connection closed'
+                    break
+                pending += chunk
+                if len(pending) > 256:
+                    raise UnsafeDevice('Control message exceeds the protocol limit.')
+                while b'\n' in pending:
+                    command, pending = pending.split(b'\n', 1)
+                    now = clock()
+                    if command == b'RELEASE':
+                        reason = 'enabled by user'
+                        return
+                    if command == b'PING':
+                        heartbeat = now + 4
+                        send({'event': 'state', 'blocked': True})
+                    elif command == b'KEEP' and trial_deadline is not None and now < trial_deadline:
+                        trial_deadline = None
+                        send({'event': 'kept'})
+                    else:
+                        raise UnsafeDevice('Invalid or expired control request.')
+            if fd in ready:
+                try:
+                    if not read(fd, struct.calcsize('llHHi') * 256):
+                        raise OSError(errno.ENODEV, 'Touchscreen disconnected')
+                except BlockingIOError:
+                    pass
+                # Events are deliberately discarded, never forwarded or logged.
+    finally:
+        try:
+            if grabbed:
+                try:
+                    ioctl(fd, EVIOCGRAB, 0)
+                except OSError:
+                    pass  # close() also releases the kernel grab, including on disconnect.
+        finally:
+            close(fd)
+        if grabbed:
+            send({'event': 'restored', 'reason': reason})
+
+
+def interrupted(*_):
+    raise InterruptedError('Helper termination requested')
+
+
+def main():
+    guard = None
+    try:
+        if os.geteuid() != 0:
+            raise UnsafeDevice('Helper must be authorized through polkit.')
+        trusted_file(HELPER)
+        if platform.machine() not in ('x86_64', 'aarch64'):
+            raise UnsafeDevice('Helper ioctl ABI is verified for Linux amd64 and arm64 only.')
+        if len(sys.argv) != 3 or not re.fullmatch('[0-9a-f]{64}', sys.argv[1]):
+            raise UnsafeDevice('Expected a device identity token and GUI process id, never a path.')
+        uid = int(os.environ.get('PKEXEC_UID', '0'))
+        pid = int(sys.argv[2])
+        if uid <= 0 or pid <= 1:
+            raise UnsafeDevice('Missing authenticated polkit caller.')
+        for stream in (0, 1):
+            info = os.fstat(stream)
+            if not stat.S_ISFIFO(info.st_mode) or info.st_uid != uid:
+                raise UnsafeDevice('Helper requires private control pipes owned by the polkit caller.')
+        guard = SessionGuard(uid, pid)
+        # Signal setup occurs before opening the fd; SIGKILL is handled by kernel close.
+        signal.signal(signal.SIGTERM, interrupted)
+        signal.signal(signal.SIGINT, interrupted)
+        signal.signal(signal.SIGHUP, interrupted)
+        os.set_blocking(1, False)
+        fd = open_verified(sys.argv[1], guard.seat)
+        own_grab(fd, guard)
+        return 0
+    except BaseException as exc:
+        try:
+            detail = 'Already grabbed by another application.' if isinstance(exc, OSError) and exc.errno == errno.EBUSY else str(exc)
+            emit({'event': 'error', 'message': detail})
+        except OSError:
+            pass
+        return 1
+    finally:
+        if guard:
+            guard.close()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

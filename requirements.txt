@@ -1,3 +1,5 @@
-# No pip dependencies. Ubuntu system dependencies:
-# python3 python3-gi gir1.2-gtk-3.0 xinput udev
-# PyGObject is supplied by apt and used with /usr/bin/python3.
+# No pip dependencies. Use Ubuntu system Python (/usr/bin/python3).
+# GUI: python3 python3-gi gir1.2-gtk-3.0 udev
+# Wayland helper: pkexec polkitd libsystemd0 (systemd-logind + desktop polkit agent)
+# X11 backend only: xinput
+# Install helper/policy separately: sudo /usr/bin/python3 -I install-system.py

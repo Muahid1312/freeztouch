@@ -48,9 +48,8 @@ class Session:
     @property
     def limitation(self):
         if self.kind == 'wayland':
-            return ('Wayland: touchscreen control is unavailable. XInput controls Xwayland devices, '
-                    'not the compositor’s physical touchscreen. No verified safe per-device method '
-                    'is implemented. Log out and choose “Ubuntu on Xorg” if available.')
+            from .wayland import installation_error
+            return installation_error()
         if self.kind != 'x11':
             return 'Session type could not be verified. Control is unavailable; start in a verified X11 session.'
         if not os.environ.get('DISPLAY'):
@@ -74,6 +73,7 @@ class Backend:
         self.session = session or Session.detect()
         self.command = command
         self.input_root = Path(input_root)
+        self.blocked_key = None
 
     def discover(self):
         devices = []
@@ -87,7 +87,7 @@ class Backend:
             if props.get('ID_INPUT_TOUCHSCREEN') != '1':
                 continue
             if any(props.get('ID_INPUT_' + kind) == '1' for kind in
-                   ('MOUSE', 'TOUCHPAD', 'KEYBOARD', 'TABLET', 'TABLET_PAD', 'JOYSTICK', 'POINTINGSTICK', 'ACCELEROMETER')):
+                   ('MOUSE', 'TOUCHPAD', 'KEYBOARD', 'TABLET', 'TABLET_PAD', 'JOYSTICK', 'POINTINGSTICK', 'ACCELEROMETER', 'SWITCH')):
                 continue
             node = props.get('DEVNAME', '')
             if node != '/dev/input/' + entry.name:
@@ -130,9 +130,18 @@ class Backend:
         return matches[0]
 
     def status(self, device):
+        if self.session.kind == 'wayland':
+            if self.session.limitation:
+                raise ControlError(self.session.limitation)
+            if device not in self.discover():
+                raise ControlError('Touchscreen disconnected or changed. Refresh the selector.')
+            # This reports only our own helper's grab, never global hardware power/state.
+            return self.blocked_key != device.key
         return self.resolve(device)[1]
 
     def set_enabled(self, device, enabled):
+        if self.session.kind == 'wayland':
+            raise ControlError('Wayland blocking and release must use the authenticated GUI helper connection.')
         xid, before = self.resolve(device)  # Revalidate physical identity on every operation.
         if before != enabled:
             try:

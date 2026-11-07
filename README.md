@@ -1,94 +1,123 @@
 # TouchSwitch
 
-A compact GTK desktop app for enabling and disabling **dedicated touchscreens** in the current X11 session. Multiple panels are selectable. Large controls, visible status, keyboard mnemonics, and a protected 15-second trial prioritize getting touch back.
+A compact GTK application that temporarily blocks touchscreen input on Ubuntu Wayland, or changes a verified touchscreen's enabled property on X11. The GUI always runs as your normal user. It includes a device selector, keyboard-accessible controls, and a protected 15-second trial.
 
-## Install on Ubuntu
+## Install and launch on Ubuntu 26.04
 
-Use Ubuntu's system Python, not a pip virtual environment:
+From the existing project directory:
 
 ```sh
 sudo apt update
-sudo apt install python3 python3-gi gir1.2-gtk-3.0 xinput udev
-cd /path/to/freeztouch
+sudo apt install python3 python3-gi gir1.2-gtk-3.0 udev pkexec polkitd libsystemd0
+sudo /usr/bin/python3 -I install-system.py
 ./launch.sh
 ```
 
-`requirements.txt` documents these system dependencies; there are no pip packages. GTK 3 is intentionally used for its availability on Ubuntu 22.04 and later. Those Ubuntu releases are intended targets, **not hardware-certified platforms**.
+The one-time privileged installer copies **only** the standalone helper and its polkit policy:
 
-Optional application-menu installation, as your normal user:
+- `/usr/libexec/touchswitch-helper` — root:root, mode 0755
+- `/usr/share/polkit-1/actions/org.touchswitch.block.policy` — root:root, mode 0644
+
+It validates root-owned directories and refuses group/world-writable or symlinked installation directories. The GUI also checks the installed helper, policy, `pkexec`, and their parent directories before offering Wayland controls. Root runs the helper using Python isolated mode (`-I`); it never imports code from this checkout. The source helper is `privileged/touchswitch-helper`.
+
+Run the GUI **without sudo**. No pip packages are needed. `requirements.txt` lists apt dependencies. An active local Wayland session managed by systemd-logind and a desktop polkit authentication agent are required; Ubuntu GNOME normally supplies both. The helper's ioctl ABI is supported on Linux **amd64 and arm64**. Missing or unsupported prerequisites are reported rather than bypassed.
+
+Optional application-menu launcher, installed as your normal user:
 
 ```sh
 ./install-launcher.py
 ```
 
-This installs a launcher in `~/.local/share/applications`, an SVG icon in the user icon theme, and a command wrapper in `~/.local/bin`. `XDG_DATA_HOME` is respected. Keep this checkout in its current location. The generated desktop launcher uses an absolute path, so it does not depend on your desktop's PATH. Existing installation files are preserved: remove them explicitly before reinstalling. The checked-in `TouchSwitch.desktop` is a template for installations where `touchswitch` is on PATH.
+This installs the desktop launcher, SVG icon, and command wrapper under `~/.local` (`XDG_DATA_HOME` is respected). Keep this checkout in place. Existing launcher files are preserved; remove them explicitly before reinstalling. After updating TouchSwitch, rerun the privileged installer above to update the installed helper and policy.
 
-To uninstall the default per-user launcher:
+For the existing X11 backend only, also install `xinput`:
 
 ```sh
-rm ~/.local/share/applications/TouchSwitch.desktop
-rm ~/.local/share/icons/hicolor/scalable/apps/touchswitch.svg
-rm ~/.local/bin/touchswitch
+sudo apt install xinput
 ```
 
-Do not launch the app, installer, or recovery tool with sudo. No privileged helper is used. An X11 authorization or permission failure is reported instead of requesting broad access to input devices.
+## Wayland: what Disable and Enable mean
 
-## Supported environments and safety
+Select your touchscreen, for example **Wacom HID 48CA Finger**. TouchSwitch discovers event nodes each time; `/dev/input/event8` is not hardcoded. If the node or sysfs identity changes after reconnecting, refresh and select the panel again.
 
-- **X11:** requires a verified `XDG_SESSION_TYPE=x11`, a display connection, udev, and XInput. The app changes only the selected XInput device's `Device Enabled` property. It checks status again after writes, including failed writes. A successful command with unchanged status is an error.
-- **Wayland:** discovery only. Controls are unavailable, with an explanation in the window. Xwayland's `DISPLAY` never enables the X11 backend. Choose “Ubuntu on Xorg” at login if your Ubuntu installation offers it; the app does not change login or system settings.
-- **Unknown sessions:** control is refused. `DISPLAY` alone is insufficient proof of X11.
-- **Strict device selection:** udev must mark the exact event node `ID_INPUT_TOUCHSCREEN=1`; mouse, touchpad, keyboard, tablet, tablet pad, joystick, pointing stick, and accelerometer classifications are rejected. On X11, the node must map uniquely to a slave pointer with a direct `TouchClass`, no `KeyClass`, and a boolean `Device Enabled` property. Names are for display only. Combined/ambiguous devices are deliberately excluded, even if they include a touchscreen.
-- Device identity and XInput IDs are resolved again before every change; cached IDs are never used for writes. Disconnections, missing commands, nonzero exits, command timeouts, and failed readback are surfaced. Device IDs may change after hotplug, so refresh the selector after connecting or reconnecting a panel.
-- No boot settings, driver blacklists, udev rules, persistent input configuration, or input-device permissions are changed. A confirmed disable lasts until the device/server resets, another tool changes it, or you enable it. Logging out of the X11 session normally resets it.
+- **Disable touchscreen** requests polkit authorization for the fixed touchscreen helper. The helper opens one verified device read-only, obtains Linux evdev `EVIOCGRAB`, and continuously drains/discards its events. This **blocks touch input**; it does not power off the hardware or change compositor settings.
+- **Touch input blocked** appears only after the helper confirms a successful exclusive grab. The helper stays alive to own that descriptor; another process cannot release its grab by opening a different descriptor.
+- **Enable touchscreen** tells that same helper to release the grab and close its descriptor. It does not require a second authorization prompt.
+- **Not blocked by TouchSwitch** means this application holds no grab. It does not claim that the hardware is powered on, that another application has not grabbed it, or that the compositor accepts touch.
 
-### Recovery trial and keyboard access
+Multiple dedicated touchscreens appear in the selector. This version holds one Wayland grab at a time; enable the selected panel before selecting another. No mouse, keyboard, or touchpad is intentionally grabbed.
 
-Every disable (including the first) offers an explanatory confirmation, then starts a **15-second trial**. An independent Python process owns the disable and restoration. “Keep disabled” accepts only a mouse or keyboard event, not a touch event. The helper verifies disabled status before accepting confirmation. An unconfirmed timeout, a closed GUI pipe, or a normally closed/crashed GUI causes an attempt to re-enable the same verified device. “Enable touchscreen” cancels an active trial.
+Every disable starts a **15-second helper-side trial**, with a separate GUI countdown. “Keep disabled” requires a mouse or keyboard event; touch confirmation is rejected. The helper's deadline uses `CLOCK_BOOTTIME`, so the GUI cannot extend the trial by pausing its countdown. Confirmation removes that trial deadline, but the grab remains tied to the live GUI and active desktop session.
 
-Use **Tab / Shift+Tab**, arrow keys in the selector, and **Space / Enter** on buttons. **Alt+T** focuses the touchscreen selector; **Alt+E** enables; **Alt+D** starts the trial; **Alt+K** confirms keeping touch disabled; **Alt+R** refreshes. Keep a working mouse or keyboard available before testing.
+Touch is released on Enable, GUI exit/crash, EOF on its private control pipe, lost GUI heartbeat (at most four seconds), helper termination, or the desktop session ending/becoming inactive. A pinned GUI pidfd and logind session checks provide independent recovery. Normal termination explicitly ungrabs and closes; even SIGKILL causes the kernel to close the descriptor and release the grab. Failed grabs, including `EBUSY`, never report blocked status.
 
-Recovery starts at the deadline but command execution/readback can take additional time. It cannot be guaranteed if the device disconnects, the X server stops responding, the machine suspends, or the recovery process itself is forcibly killed. Errors are never reported as successful restoration. Once you explicitly keep touch disabled, exiting the app leaves that session setting in place.
+On disconnect, the helper closes the fd and reports the error. On suspend/resume it releases as soon as execution resumes, using boottime/monotonic divergence or heartbeat expiry, and **does not automatically re-grab**. Refresh and start a fresh authorized trial if needed. Device failures, a stalled kernel, or a powered-off/suspended machine cannot be fixed by a GUI timer. Closing the app releases even a confirmed Wayland block.
 
-## Re-enable manually
+Use **Tab / Shift+Tab**, selector arrow keys, and **Space / Enter**. **Alt+T** selects the device; **Alt+E** enables/releases; **Alt+D** starts a trial; **Alt+K** keeps it blocked; **Alt+R** refreshes. Keep a working physical mouse or keyboard available for your first real-device trial.
 
-Use a keyboard to open a terminal **in the same desktop session**, without sudo:
+## Device validation and privilege boundary
+
+The unprivileged GUI sends a SHA-256 identity token (sysfs path plus device name) and its own PID to the fixed helper through `pkexec --disable-internal-agent`. It sends no device path, shell text, arbitrary command, or environment configuration to execute.
+
+The root helper independently enumerates `/sys/class/input/event*`, resolves the token uniquely, and validates:
+
+1. udev `ID_INPUT_TOUCHSCREEN=1`, the expected kernel-created node, and the active session's seat. Mouse, touchpad, keyboard, tablet, tablet pad, joystick, pointing-stick, accelerometer, or switch classifications reject the device.
+2. The opened character fd's major/minor against sysfs, its `/sys/dev/char` identity, and a second udev/name/path check after opening. `O_NOFOLLOW` prevents following a device-node symlink.
+3. Kernel capability ioctls on that exact fd: direct input, absolute X/Y touch coordinates, no relative motion, keyboard/mouse/pen buttons, switches, or unrelated axes. Only finger/touch/tool-count keys are permitted. Ambiguous/mixed devices are refused even if their name contains “Finger”.
+4. The polkit-supplied `PKEXEC_UID`, GUI process owner/pidfd, local active Wayland session and seat from logind. GNOME apps launched in user-manager scopes use logind's graphical session for the authenticated uid when the PID has no session cgroup.
+
+Communication uses inherited anonymous stdin/stdout pipes owned by the authenticated caller, with no named/public socket. The only GUI messages are bounded `PING`, `KEEP`, and `RELEASE`; malformed messages release the fd. Helper responses contain state/errors, never touchscreen events. A frozen GUI that stops consuming responses also cannot hold touch indefinitely.
+
+The action uses `auth_admin` for active sessions and denies inactive/remote use. It does not retain authorization (`auth_admin_keep` is not used). Opening/grabbing each selected panel requires authorization. Releasing an already authorized grab uses its existing connection. No input group membership, global permissions, udev rules, boot settings, blacklists, or persistent input settings are changed.
+
+## Emergency release
+
+First use **Enable touchscreen** or close TouchSwitch. If the GUI is frozen, wait four seconds for the helper heartbeat to expire.
+
+From a keyboard-accessible terminal, this administrator command terminates **only TouchSwitch's installed root helpers**, releasing their descriptors:
 
 ```sh
-cd /path/to/freeztouch
+sudo /usr/bin/pkill -TERM -f '^/usr/bin/python3 -I /usr/libexec/touchswitch-helper '
+```
+
+It affects all TouchSwitch grabs on the machine, not other applications. If a helper fails to terminate normally, the same narrowly matched command with `-KILL` closes its fd through kernel process cleanup. A nonzero `pkill` result can mean no helper is running. You cannot release another process's EVIOCGRAB by issuing an ungrab on a newly opened fd.
+
+`/usr/bin/python3 -m touchswitch.recover` prints these Wayland recovery instructions. On X11 it retains its enable-only recovery behavior:
+
+```sh
 /usr/bin/python3 -m touchswitch.recover
-# Choose the exact node printed above (example only):
-/usr/bin/python3 -m touchswitch.recover --node /dev/input/event3
+/usr/bin/python3 -m touchswitch.recover --node /dev/input/eventN
 ```
 
-This recovery command only enables; it applies the same touchscreen and identity checks as the GUI and verifies the result. There is no command-line disable shortcut that bypasses the trial.
+For X11, the app still requires a unique direct-touch XInput slave pointer, matching `Device Node`, no keyboard class, and a boolean `Device Enabled` property. It checks status after writes, including failures. A confirmed X11 disable follows the previous session-only behavior; unlike the Wayland grab, it can remain after GUI exit.
 
-If the app's files are unavailable, `xinput list` and `xinput list-props ID` can identify the panel's current `Device Node` and `Device Enabled` property. Verify that the device is your touchscreen (not a mouse/touchpad/keyboard), then run `xinput enable ID` and check `xinput list-props ID` again. Never copy an old numeric ID blindly. Logging out and back into the desktop is another recovery option. These XInput commands do not control physical touchscreens on Wayland.
-
-## Wayland investigation
-
-Reviewed upstream documentation/source on 2026-11-07:
-
-- [Wayland core protocol, upstream mirror](https://github.com/wayland-mirror/wayland/blob/main/protocol/wayland.xml): `wl_seat` capabilities and `wl_touch` describe input delivery to clients. They expose no general client request to disable a physical touchscreen.
-- [GNOME desktop peripheral schemas](https://github.com/GNOME/gsettings-desktop-schemas/blob/master/schemas/org.gnome.desktop.peripherals.gschema.xml.in): the touchscreen schema provides output mapping; `send-events` belongs to the **touchpad** schema. Using it would affect the wrong device.
-- [XInput manual](https://www.x.org/releases/current/doc/man/man1/xinput.1.xhtml), also available as `man xinput` on installed systems: property inspection and device enable/disable operations. TouchSwitch additionally requires udev identity and direct-touch capabilities before changing the enabled property.
-
-The Wayland and GNOME sources were retrieved during implementation. The libinput documentation site was inaccessible from this environment, so no method from it was assumed to work. Compositor-specific APIs may exist elsewhere; none is claimed supported or used here. Kernel unbinding, device permission changes, privileged input grabbing, and persistent settings are intentionally outside this app's session-only method.
-
-## Tests and validation
+## Tests and real-device verification
 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -v
 ```
 
-Backend tests mock system commands and exercise strict selection, multiple panels, recycled IDs, disconnections, unsupported sessions, permission failures, timeouts, readback failures, and watchdog recovery/confirmation. GTK tests execute when GTK and a display are available; otherwise they are explicitly skipped. No tests write real input properties.
+Tests mock system commands, kernel ioctls, device fds, session metadata, and polkit/helper responses; they never grab host input devices. GTK tests run when a display is available and explicitly skip otherwise. The original X11 watchdog subprocess tests also exercise a real 15-second timeout against a fake backend.
 
-For optional GUI testing on a machine with Xvfb:
+See [VALIDATION.md](VALIDATION.md) for actual results and untested integration points. Automated tests do **not** establish compatibility with your Wacom HID 48CA Finger. Still required on your Ubuntu Wayland laptop: helper installation and polkit dialog, actual classification/capability acceptance, first trial expiration, explicit confirmation/release, preserved mouse/keyboard operation, app termination, disconnect, and suspend/resume. If safe validation rejects the panel, the app reports why and makes no grab; do not relax input-device permissions to work around it.
+
+## API verification
+
+Upstream sources retrieved and reviewed on 2026-11-07:
+
+- [Linux input UAPI](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input.h): `EVIOCGRAB`, `EVIOCGBIT`, and `EVIOCGPROP` definitions.
+- [Linux evdev implementation](https://github.com/torvalds/linux/blob/master/drivers/input/evdev.c): exclusive event routing, `EBUSY` on existing grabs, explicit ungrab, and `evdev_release()` ungrabbing on fd close.
+- [Linux input event documentation](https://github.com/torvalds/linux/blob/master/Documentation/input/event-codes.rst): direct/pointer properties and capability meanings.
+- [pkexec documentation](https://github.com/polkit-org/polkit/blob/master/docs/man/pkexec.xml): sanitized environment, `PKEXEC_UID`, action executable annotation, internal-agent disabling, and the need to validate arguments in the invoked program.
+- [systemd login API](https://github.com/systemd/systemd/blob/main/src/systemd/sd-login.h): authenticated session owner, graphical session fallback, type, seat, and active-session checks.
+
+## Uninstall
+
+Close TouchSwitch first, then remove its root-installed files:
 
 ```sh
-xvfb-run -a env XDG_SESSION_TYPE=x11 /usr/bin/python3 -m unittest discover -s tests -v
+sudo rm /usr/libexec/touchswitch-helper
+sudo rm /usr/share/polkit-1/actions/org.touchswitch.block.policy
 ```
 
-Validation in this development environment: Debian 13, Python 3, GTK 3.24, an isolated Xorg dummy display, and **no physical touchscreen**. Automated backend/GTK results are recorded in `VALIDATION.md`. No Ubuntu hardware, real XInput touchscreen toggle, real Wayland touchscreen, or physical mouse/keyboard recovery trial has been tested. Verify on your laptop using the trial before relying on this app.
-
-Source: `touchswitch/backend.py` handles discovery and verified changes; `app.py` is the GUI; `watchdog.py` owns the independent trial; `recover.py` provides enable-only terminal recovery. All commands use argument lists with bounded execution time; none runs through a shell.
+Optional per-user launcher files are `~/.local/share/applications/TouchSwitch.desktop`, `~/.local/share/icons/hicolor/scalable/apps/touchswitch.svg`, and `~/.local/bin/touchswitch` (adjust the data paths if using `XDG_DATA_HOME`). Removing the helper file alone does not terminate an already running process; close the GUI or use the emergency release first.

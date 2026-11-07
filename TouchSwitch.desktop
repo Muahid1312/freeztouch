@@ -2,7 +2,7 @@
 Version=1.0
 Type=Application
 Name=TouchSwitch
-Comment=Safely enable or disable a touchscreen for the current X11 session
+Comment=Temporarily block touchscreen input with automatic recovery
 Exec=touchswitch
 Icon=touchswitch
 Terminal=false

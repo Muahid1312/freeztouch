@@ -13,6 +13,7 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 from gi.repository import Gdk, GLib, Gtk
 from .backend import Backend
+from . import wayland
 
 CSS = b'''
 window { background: #f5f6fa; }
@@ -84,6 +85,7 @@ class Window(Gtk.Window):
         self.refresh()
         GLib.timeout_add_seconds(5, self.poll)
         GLib.timeout_add(200, self.tick)
+        GLib.timeout_add_seconds(1, self.heartbeat)
 
     @staticmethod
     def label(text, style):
@@ -106,7 +108,11 @@ class Window(Gtk.Window):
 
     def status(self, enabled):
         self.enabled = enabled
-        self.indicator.set_text('●  Enabled' if enabled is True else '○  Disabled' if enabled is False else '—  Status unavailable')
+        if self.backend.session.kind == 'wayland':
+            text = '●  Not blocked by TouchSwitch' if enabled is True else '○  Touch input blocked' if enabled is False else '—  Status unavailable'
+        else:
+            text = '●  Enabled' if enabled is True else '○  Disabled' if enabled is False else '—  Status unavailable'
+        self.indicator.set_text(text)
         context = self.indicator.get_style_context()
         for style in ('enabled', 'disabled'):
             context.remove_class(style)
@@ -169,7 +175,7 @@ class Window(Gtk.Window):
         if error:
             self.message.set_text(error)
         elif self.process is None:
-            self.message.set_text('Changes last for this X11 session. Every disable starts a 15-second recovery trial.')
+            self.message.set_text('Wayland: Disable blocks touch events, without powering off the device. Authorization opens only the selected touchscreen. Closing the app restores touch.' if self.backend.session.kind == 'wayland' else 'Changes last for this X11 session. Every disable starts a 15-second recovery trial.')
 
     def enable_selected(self):
         device = self.selected()
@@ -185,18 +191,26 @@ class Window(Gtk.Window):
             return
         dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
                                   buttons=Gtk.ButtonsType.OK_CANCEL, text='Try disabling touch for 15 seconds?')
-        dialog.format_secondary_text('Have a mouse or keyboard ready. Touch will automatically return unless you choose “Keep disabled” using your mouse or keyboard. Closing this app also cancels an unconfirmed trial.')
+        dialog.format_secondary_text('Have a mouse or keyboard ready. Touch will automatically return unless you choose “Keep disabled” using your mouse or keyboard. On Wayland, closing this app releases touch even after confirmation.')
         dialog.set_default_response(Gtk.ResponseType.CANCEL)
         response = dialog.run()
         dialog.destroy()
         if response != Gtk.ResponseType.OK:
             return
         try:
-            self.process = subprocess.Popen([sys.executable, '-m', 'touchswitch.watchdog', json.dumps(asdict(device))],
+            command = (wayland.helper_command(device) if self.backend.session.kind == 'wayland' else
+                       [sys.executable, '-m', 'touchswitch.watchdog', json.dumps(asdict(device))])
+            self.process = subprocess.Popen(command,
                                             cwd=str(Path(__file__).resolve().parent.parent),
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.PIPE, text=True, start_new_session=True)
-        except OSError as exc:
+            if self.backend.session.kind == 'wayland':
+                os.set_blocking(self.process.stdin.fileno(), False)
+        except (OSError, RuntimeError) as exc:
+            if self.process:
+                self.process.stdin.close()
+                threading.Thread(target=self.process.wait, daemon=True).start()
+                self.process = None
             self.message.set_text(f'Could not start recovery process: {exc}')
             return
         self.trial_device = device
@@ -226,19 +240,33 @@ class Window(Gtk.Window):
         kind = event.get('event')
         if kind in ('restored', 'kept', 'error'):
             self.trial_outcome = True
-        if kind == 'disabled':
+        if kind == 'state':
+            if event.get('blocked') is True:
+                self.backend.blocked_key = self.trial_device.key
+                self.status(False)
+        elif kind == 'disabled':
+            if self.backend.session.kind == 'wayland':
+                self.backend.blocked_key = self.trial_device.key
             self.busy = False
             self.deadline = time.monotonic() + event['seconds']
             self.status(False)
             self.keep.show()
             self.keep.grab_focus()
         elif kind == 'restored':
+            self.backend.blocked_key = None
+            self.deadline = 0
+            self.keep.hide()
             self.status(True)
-            self.message.set_text('Trial ended. Touchscreen was re-enabled and its status verified.')
+            self.message.set_text(('Touch input released: ' + event.get('reason', 'enabled by user') + '. The helper closed its device descriptor.') if self.backend.session.kind == 'wayland' else 'Trial ended. Touchscreen was re-enabled and its status verified.')
         elif kind == 'kept':
+            self.deadline = 0
+            self.keep.hide()
             self.status(False)
-            self.message.set_text('Touchscreen remains disabled for this session. Use Enable touchscreen to restore it.')
+            self.message.set_text('Touch input remains blocked while this app and session stay active. Enable touchscreen or close the app to release it.' if self.backend.session.kind == 'wayland' else 'Touchscreen remains disabled for this session. Use Enable touchscreen to restore it.')
         elif kind == 'error':
+            self.backend.blocked_key = None
+            self.deadline = 0
+            self.keep.hide()
             self.status(None)
             self.message.set_text('Recovery/control error: ' + event.get('message', 'Unknown error') +
                                   ' Use Enable touchscreen or the manual recovery instructions in README.')
@@ -254,8 +282,11 @@ class Window(Gtk.Window):
             return
         if self.process and self.deadline > time.monotonic():
             try:
-                self.process.stdin.write('KEEP\n')
-                self.process.stdin.flush()
+                if self.backend.session.kind == 'wayland':
+                    wayland.send(self.process, b'KEEP\n')
+                else:
+                    self.process.stdin.write('KEEP\n')
+                    self.process.stdin.flush()
                 self.keep.set_sensitive(False)
                 self.deadline = 0
             except (OSError, ValueError):
@@ -263,6 +294,11 @@ class Window(Gtk.Window):
 
     def cancel_trial(self):
         if self.process and self.process.stdin and not self.process.stdin.closed:
+            if self.backend.session.kind == 'wayland':
+                try:
+                    wayland.send(self.process, b'RELEASE\n')
+                except OSError:
+                    pass
             self.process.stdin.close()
         self.keep.set_sensitive(False)
         self.deadline = 0
@@ -272,13 +308,20 @@ class Window(Gtk.Window):
         if self.closed:
             return False
         self.process = None
+        self.backend.blocked_key = None
         self.trial_device = None
         self.busy = False
         self.deadline = 0
         self.keep.hide()
         self.keep.set_sensitive(True)
         if not self.trial_outcome or (code and stderr):
-            self.message.set_text(f'Recovery process exited unexpectedly ({code}). ' + stderr[:400] +
+            detail = f'Recovery process exited unexpectedly ({code}). '
+            if self.backend.session.kind == 'wayland':
+                if code == 126:
+                    detail = 'Touchscreen authorization was cancelled. '
+                elif code == 127:
+                    detail = 'Authorization failed. Check the desktop polkit agent and installed policy. '
+            self.message.set_text(detail + stderr[:400] +
                                   ' Recheck status and use Enable touchscreen if needed.')
         self.controls()
         # Verify independently after every trial, including unexpected helper exits.
@@ -290,6 +333,15 @@ class Window(Gtk.Window):
                 self.message.set_text((message + '\n' + error) if error else message)
             self.work(lambda: self.backend.status(device), done)
         return False
+
+    def heartbeat(self):
+        if (self.process and self.trial_device and self.backend.session.kind == 'wayland'
+                and self.backend.blocked_key == self.trial_device.key):
+            try:
+                wayland.send(self.process, b'PING\n')
+            except (OSError, ValueError):
+                self.cancel_trial()
+        return not self.closed
 
     def tick(self):
         if self.deadline:
