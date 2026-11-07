@@ -195,7 +195,7 @@ def own_grab(fd, guard, send=emit, clock=boottime, poll=select.select,
         now = clock()
         trial_deadline, heartbeat = now + 15, now + 4
         previous_boot, previous_mono = now, time.monotonic()
-        send({'event': 'disabled', 'seconds': 15})
+        send({'event': 'disabled', 'seconds': 15, 'trial_remaining': 15, 'confirmed': False})
         pending = b''
         while True:
             now, mono = clock(), time.monotonic()
@@ -230,10 +230,12 @@ def own_grab(fd, guard, send=emit, clock=boottime, poll=select.select,
                         return
                     if command == b'PING':
                         heartbeat = now + 4
-                        send({'event': 'state', 'blocked': True})
-                    elif command == b'KEEP' and trial_deadline is not None and now < trial_deadline:
-                        trial_deadline = None
-                        send({'event': 'kept'})
+                        send({'event': 'state', 'blocked': True,
+                              'trial_remaining': max(0, trial_deadline - now) if trial_deadline is not None else None,
+                              'confirmed': trial_deadline is None})
+                    elif command == b'KEEP' and (trial_deadline is None or now < trial_deadline):
+                        trial_deadline = None  # Cancel the helper timeout, not just the GUI countdown.
+                        send({'event': 'kept', 'confirmed': True, 'trial_remaining': None})
                     else:
                         raise UnsafeDevice('Invalid or expired control request.')
             if fd in ready:

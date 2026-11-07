@@ -40,6 +40,9 @@ class Window(Gtk.Window):
         self.trial_device = None
         self.deadline = 0
         self.trial_outcome = False
+        self.session_confirmed = False
+        self.confirmation_pending = False
+        self.helper_confirmed = False
         self.closed = False
         self.enabled = None
         provider = Gtk.CssProvider()
@@ -72,8 +75,11 @@ class Window(Gtk.Window):
         self.disable.connect('clicked', lambda *_: self.start_trial())
         box.pack_start(self.enable, False, False, 0)
         box.pack_start(self.disable, False, False, 0)
-        self.keep = Gtk.Button.new_with_mnemonic('_Keep disabled (mouse or keyboard)')
+        self.keep = Gtk.Button.new_with_mnemonic('_Keep touchscreen disabled')
         self.keep.connect('clicked', self.confirm)
+        self.keep.connect('key-press-event', self.confirm_key)
+        self.keep.connect('button-release-event', self.confirm_pointer)
+        self.keep.connect('mnemonic-activate', self.confirm_mnemonic)
         box.pack_start(self.keep, False, False, 0)
         self.refresh_button = Gtk.Button.new_with_mnemonic('_Refresh devices')
         self.refresh_button.connect('clicked', lambda *_: self.refresh())
@@ -109,7 +115,7 @@ class Window(Gtk.Window):
     def status(self, enabled):
         self.enabled = enabled
         if self.backend.session.kind == 'wayland':
-            text = '●  Not blocked by TouchSwitch' if enabled is True else '○  Touch input blocked' if enabled is False else '—  Status unavailable'
+            text = '●  Not blocked by TouchSwitch' if enabled is True else ('○  Touch input blocked' if self.helper_confirmed else '○  Touch input blocked — trial') if enabled is False else '—  Status unavailable'
         else:
             text = '●  Enabled' if enabled is True else '○  Disabled' if enabled is False else '—  Status unavailable'
         self.indicator.set_text(text)
@@ -189,14 +195,16 @@ class Window(Gtk.Window):
         device = self.selected()
         if not device or self.busy or self.process:
             return
-        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
-                                  buttons=Gtk.ButtonsType.OK_CANCEL, text='Try disabling touch for 15 seconds?')
-        dialog.format_secondary_text('Have a mouse or keyboard ready. Touch will automatically return unless you choose “Keep disabled” using your mouse or keyboard. On Wayland, closing this app releases touch even after confirmation.')
-        dialog.set_default_response(Gtk.ResponseType.CANCEL)
-        response = dialog.run()
-        dialog.destroy()
-        if response != Gtk.ResponseType.OK:
-            return
+        trial_required = self.backend.session.kind != 'wayland' or not self.session_confirmed
+        if trial_required:
+            dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                      buttons=Gtk.ButtonsType.OK_CANCEL, text='Try disabling touch for 15 seconds?')
+            dialog.format_secondary_text('Have a mouse or keyboard ready. Touch will automatically return unless you choose “Keep touchscreen disabled” using your mouse or keyboard. On Wayland, closing this app releases touch even after confirmation.')
+            dialog.set_default_response(Gtk.ResponseType.CANCEL)
+            response = dialog.run()
+            dialog.destroy()
+            if response != Gtk.ResponseType.OK:
+                return
         try:
             command = (wayland.helper_command(device) if self.backend.session.kind == 'wayland' else
                        [sys.executable, '-m', 'touchswitch.watchdog', json.dumps(asdict(device))])
@@ -215,9 +223,11 @@ class Window(Gtk.Window):
             return
         self.trial_device = device
         self.trial_outcome = False
+        self.confirmation_pending = False
+        self.helper_confirmed = False
         self.busy = True
         self.controls()
-        self.message.set_text('Starting protected trial…')
+        self.message.set_text('Starting protected trial…' if trial_required else 'Blocking touchscreen…')
         process = self.process
         def listen():
             try:
@@ -243,6 +253,12 @@ class Window(Gtk.Window):
         if kind == 'state':
             if event.get('blocked') is True:
                 self.backend.blocked_key = self.trial_device.key
+                if 'trial_remaining' in event:
+                    if event.get('confirmed') is True and event['trial_remaining'] is None:
+                        self.accept_confirmation()
+                    elif event['trial_remaining'] is not None:
+                        self.helper_confirmed = False
+                        self.deadline = time.monotonic() + max(0, event['trial_remaining'])
                 self.status(False)
         elif kind == 'disabled':
             if self.backend.session.kind == 'wayland':
@@ -250,21 +266,29 @@ class Window(Gtk.Window):
             self.busy = False
             self.deadline = time.monotonic() + event['seconds']
             self.status(False)
-            self.keep.show()
-            self.keep.grab_focus()
+            self.keep.set_sensitive(True)
+            if self.backend.session.kind == 'wayland' and self.session_confirmed:
+                # Each new helper still starts safely; cancel its trial immediately
+                # only after this app session's first confirmation was acknowledged.
+                self.request_confirmation()
+            else:
+                self.keep.show()
+                self.keep.grab_focus()
+                self.tick()
         elif kind == 'restored':
             self.backend.blocked_key = None
+            self.helper_confirmed = False
+            self.confirmation_pending = False
             self.deadline = 0
             self.keep.hide()
             self.status(True)
             self.message.set_text(('Touch input released: ' + event.get('reason', 'enabled by user') + '. The helper closed its device descriptor.') if self.backend.session.kind == 'wayland' else 'Trial ended. Touchscreen was re-enabled and its status verified.')
         elif kind == 'kept':
-            self.deadline = 0
-            self.keep.hide()
-            self.status(False)
-            self.message.set_text('Touch input remains blocked while this app and session stay active. Enable touchscreen or close the app to release it.' if self.backend.session.kind == 'wayland' else 'Touchscreen remains disabled for this session. Use Enable touchscreen to restore it.')
+            self.accept_confirmation()
         elif kind == 'error':
             self.backend.blocked_key = None
+            self.helper_confirmed = False
+            self.confirmation_pending = False
             self.deadline = 0
             self.keep.hide()
             self.status(None)
@@ -272,25 +296,61 @@ class Window(Gtk.Window):
                                   ' Use Enable touchscreen or the manual recovery instructions in README.')
         return False
 
-    def confirm(self, *_):
-        event = Gtk.get_current_event()
-        source = event.get_source_device() if event else None
-        keyboard = event and event.type in (Gdk.EventType.KEY_PRESS, Gdk.EventType.KEY_RELEASE)
-        mouse = source and source.get_source() == Gdk.InputSource.MOUSE
-        if not (keyboard or mouse):
-            self.message.set_text('Confirm with a physical mouse or keyboard. Touch confirmation is not accepted.')
+    def accept_confirmation(self):
+        # Only the helper acknowledgement/state may mark the trial confirmed.
+        self.session_confirmed = True
+        self.helper_confirmed = True
+        self.confirmation_pending = False
+        self.deadline = 0
+        self.keep.hide()
+        self.status(False)
+        self.message.set_text('Helper confirmed: touch stays blocked until Enable touchscreen or closing this app.' if self.backend.session.kind == 'wayland' else 'Touchscreen remains disabled for this session. Use Enable touchscreen to restore it.')
+
+    def request_confirmation(self):
+        if not self.process or self.confirmation_pending or self.deadline <= time.monotonic():
             return
-        if self.process and self.deadline > time.monotonic():
-            try:
-                if self.backend.session.kind == 'wayland':
-                    wayland.send(self.process, b'KEEP\n')
-                else:
-                    self.process.stdin.write('KEEP\n')
-                    self.process.stdin.flush()
-                self.keep.set_sensitive(False)
-                self.deadline = 0
-            except (OSError, ValueError):
-                self.message.set_text('Trial already ended. Rechecking status…')
+        try:
+            if self.backend.session.kind == 'wayland':
+                wayland.send(self.process, b'KEEP\n')
+            else:
+                self.process.stdin.write('KEEP\n')
+                self.process.stdin.flush()
+            self.confirmation_pending = True
+            self.keep.set_sensitive(False)
+            self.message.set_text('Waiting for helper to confirm that its trial timeout is cancelled…')
+        except (OSError, ValueError) as exc:
+            self.message.set_text(f'Could not confirm: {exc}. The recovery trial remains active.')
+
+    @staticmethod
+    def pointer_confirmation(event):
+        source = event.get_source_device() if event else None
+        return bool(source and source.get_source() in (Gdk.InputSource.MOUSE, Gdk.InputSource.TOUCHPAD))
+
+    def confirm_pointer(self, _button, event):
+        if event.button == 1 and self.pointer_confirmation(event):
+            self.request_confirmation()
+            return False
+        return True  # Never turn an emulated touch click into confirmation.
+
+    def confirm_key(self, _button, event):
+        if event.keyval in (Gdk.KEY_space, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.request_confirmation()
+            return True
+        return False
+
+    def confirm_mnemonic(self, *_):
+        self.request_confirmation()
+        return True
+
+    def confirm(self, *_):
+        # GTK can emit clicked after its originating key event has finished.
+        # Explicit key/mnemonic handlers above preserve keyboard activation.
+        event = Gtk.get_current_event()
+        keyboard = event and event.type in (Gdk.EventType.KEY_PRESS, Gdk.EventType.KEY_RELEASE)
+        if keyboard or self.pointer_confirmation(event):
+            self.request_confirmation()
+        else:
+            self.message.set_text('Confirm with a mouse or keyboard. Touch confirmation is not accepted.')
 
     def cancel_trial(self):
         if self.process and self.process.stdin and not self.process.stdin.closed:
@@ -309,6 +369,8 @@ class Window(Gtk.Window):
             return False
         self.process = None
         self.backend.blocked_key = None
+        self.helper_confirmed = False
+        self.confirmation_pending = False
         self.trial_device = None
         self.busy = False
         self.deadline = 0
@@ -346,7 +408,9 @@ class Window(Gtk.Window):
     def tick(self):
         if self.deadline:
             seconds = max(0, int(self.deadline - time.monotonic()) + 1)
-            self.message.set_text(f'Trial: restoring touch in {seconds}s. Confirm using a mouse or keyboard to keep it disabled.')
+            self.keep.set_label(f'_Keep touchscreen disabled ({seconds}s)')
+            self.keep.set_use_underline(True)
+            self.message.set_text(f'Waiting for helper confirmation ({seconds}s remaining)…' if self.confirmation_pending else f'Trial: restoring touch in {seconds}s. Choose Keep touchscreen disabled using a mouse or keyboard.')
         return not self.closed
 
     def poll(self):

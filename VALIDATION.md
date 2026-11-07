@@ -4,12 +4,13 @@ Development host: Debian GNU/Linux 13 (cloud), amd64, Python 3, GTK 3.24. No phy
 
 ## Passed
 
-- **64 tests passed, none skipped**, in 15.307 seconds using:
-  `DISPLAY=:97 XDG_SESSION_TYPE=x11 /usr/bin/python3 -m unittest discover -s tests -v`.
+- **68 tests passed, none skipped**, in 15.378 seconds using:
+  `DISPLAY=:96 XDG_SESSION_TYPE=x11 /usr/bin/python3 -m unittest discover -s tests -v`.
   The display was an isolated Xorg dummy server, not a real Wayland desktop. Wayland session, hardware, helper and polkit responses were mocked in GTK tests.
 - **29 focused helper/client tests** cover udev classification, dedicated direct-touch capabilities, rejection of keyboard/mouse/touchpad/pen/mixed inputs, seat matching, identity tokens, changing event numbers, fd identity mismatch, verified open, failed-validation cleanup, authenticated caller uid/session fallback, inactive sessions, and fixed/bounded commands.
 - Helper lifecycle tests cover `EBUSY` and permission failures, success notification after grab, draining/discarding events, release, ungrab failures, helper-side 15-second timeout despite continuing heartbeats, confirmed lifetime, GUI EOF/pid death, heartbeat loss, session end, suspend/resume detection, disconnection, and termination exceptions. All kernel operations are mocked; no host input fd was opened or grabbed.
-- **Seven GTK checks** cover X11 regression behavior, missing-helper instructions, ready Wayland controls, block/confirm/release transitions over the same helper connection, and visible authorization denial without reporting a grab.
+- **Eleven GTK checks** cover X11 regression behavior, missing-helper instructions, ready Wayland controls, block/confirm/release transitions over the same helper connection, and visible authorization denial without reporting a grab.
+- New GUI/helper round-trip tests route keyboard confirmation through the actual helper command parser with mocked transport/kernel operations and a controlled clock. They verify confirmed blocking beyond 16 seconds, automatic confirmation for the next disable in the same app session, unconfirmed release at 15 seconds, and GUI countdown cancellation only on helper acknowledgement. Separate pointer checks accept mouse confirmation and reject touch.
 - Existing X11 command-failure, selection, installer, and independent-watchdog tests pass. The old watchdog's real subprocess/pipe tests include an actual 15-second timeout using a fake backend.
 - System helper/policy syntax parsed, all Python sources compiled, launcher shell syntax and Git whitespace checks passed. The system installer refuses an unprivileged invocation with the exact installation command.
 - A small C check against this host's Linux headers produced `EVIOCGRAB=0x40044590`, `EVIOCGBIT(EV_KEY,96)=0x80604521`, and `EVIOCGPROP(8)=0x80084509`, matching the standalone helper's ioctl encoding on amd64. The ABI is limited to amd64/arm64; other architectures are refused.

@@ -169,7 +169,10 @@ class GrabLifecycle(unittest.TestCase):
         self.commands = [b'KEEP\n'] + [b'PING\n'] * 35 + [b'RELEASE\n']
         self.own()
         self.assertGreater(self.now, 15)
-        self.assertIn({'event': 'kept'}, self.events)
+        states = [event for event in self.events if event['event'] == 'state']
+        self.assertTrue(states)
+        self.assertTrue(all(event['confirmed'] and event['trial_remaining'] is None for event in states))
+        self.assertIn({'event': 'kept', 'confirmed': True, 'trial_remaining': None}, self.events)
         self.assert_released()
 
     def test_gui_eof_releases_even_after_confirmation(self):
