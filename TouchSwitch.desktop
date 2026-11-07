@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=TouchSwitch
+Comment=Safely enable or disable a touchscreen for the current X11 session
+Exec=touchswitch
+Icon=touchswitch
+Terminal=false
+Categories=Utility;Settings;HardwareSettings;
+Keywords=touchscreen;touch;input;
+StartupNotify=true
