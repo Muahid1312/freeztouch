@@ -113,113 +113,28 @@ class Gui(unittest.TestCase):
 
     @patch('touchswitch.wayland.installation_error', return_value='')
     @patch('touchswitch.wayland.send')
-    def test_keyboard_confirmation_waits_for_helper_ack(self, send, _):
-        from types import SimpleNamespace
-        from touchswitch.app import Gdk
-        window, _ = self.make_window(session='wayland')
+    def test_disable_blocks_immediately_without_confirmation_button(self, send, _):
+        window, backend = self.make_window(session='wayland')
         window.process = Mock()
         window.trial_device = window.selected()
-        window.trial_event({'event': 'disabled', 'seconds': 15})
-        self.assertIn('Keep touchscreen disabled', window.keep.get_label())
-        self.assertIn('15s', window.keep.get_label())
-        # Explicit key handling works even when clicked has no current GDK event.
-        with patch('touchswitch.app.Gtk.get_current_event', return_value=None):
-            self.assertTrue(window.confirm_key(window.keep, SimpleNamespace(keyval=Gdk.KEY_space)))
-        send.assert_called_once_with(window.process, b'KEEP\n')
-        self.assertTrue(window.confirmation_pending)
-        self.assertGreater(window.deadline, 0)
-        self.assertFalse(window.session_confirmed)
-        window.trial_event({'event': 'kept', 'confirmed': True, 'trial_remaining': None})
+        window.trial_event({'event': 'disabled', 'seconds': 0, 'confirmed': True,
+                            'trial_remaining': None})
+        self.assertTrue(window.helper_confirmed)
         self.assertEqual(window.deadline, 0)
-        self.assertTrue(window.session_confirmed)
         self.assertFalse(window.keep.get_visible())
+        self.assertIn('until Enable', window.message.get_text())
+        send.assert_not_called()
 
     @patch('touchswitch.wayland.installation_error', return_value='')
     @patch('touchswitch.wayland.send')
-    def test_mouse_confirmation_accepts_mouse_and_rejects_touch(self, send, _):
-        from touchswitch.app import Gdk
-        window, _ = self.make_window(session='wayland')
+    def test_older_helper_timeout_cancelled_automatically(self, send, _):
+        window, backend = self.make_window(session='wayland')
         window.process = Mock()
         window.trial_device = window.selected()
         window.trial_event({'event': 'disabled', 'seconds': 15})
-        event = Mock(button=1)
-        event.get_source_device.return_value.get_source.return_value = Gdk.InputSource.TOUCHSCREEN
-        window.confirm_pointer(window.keep, event)
-        send.assert_not_called()
-        event.get_source_device.return_value.get_source.return_value = Gdk.InputSource.MOUSE
-        window.confirm_pointer(window.keep, event)
         send.assert_called_once_with(window.process, b'KEEP\n')
-
-    @patch('touchswitch.wayland.installation_error', return_value='')
-    def test_gui_helper_roundtrip_confirmed_past_15s_and_later_disable(self, _):
-        self.run_helper_roundtrip(confirm=True, repeat=True)
-
-    @patch('touchswitch.wayland.installation_error', return_value='')
-    def test_gui_helper_roundtrip_unconfirmed_expires_at_15s(self, _):
-        self.run_helper_roundtrip(confirm=False)
-
-    def run_helper_roundtrip(self, confirm, repeat=False):
-        """Actual helper parser/timer and GUI callbacks; only kernel/time/transport mocked."""
-        from types import SimpleNamespace
-        from test_evdev_helper import helper
-        from touchswitch.app import Gdk
-        window, _ = self.make_window(session='wayland')
-
-        def run_once(first):
-            now = [0.0]
-            queued = []
-            current = [b'']
-            process = Mock()
-            process.stdin.closed = False
-            window.process = process
-            window.trial_device = window.selected()
-            ioctl, close = Mock(), Mock()
-            events = []
-
-            def send_command(process, command):
-                queued.append(command)
-
-            def received(event):
-                events.append(event)
-                window.trial_event(event)
-                if event['event'] == 'disabled':
-                    if first and confirm:
-                        window.confirm_key(window.keep, SimpleNamespace(keyval=Gdk.KEY_Return))
-                    elif not first:
-                        self.assertFalse(window.keep.get_visible())
-
-            def poll(*args):
-                now[0] += args[-1]
-                if now[0] > 16:
-                    # A live confirmed grab must survive the original deadline.
-                    ioctl.assert_called_once_with(55, helper.EVIOCGRAB, 1)
-                    close.assert_not_called()
-                    self.assertTrue(window.helper_confirmed)
-                    self.assertEqual(window.deadline, 0)
-                    window.enable_selected()
-                elif not queued:
-                    window.heartbeat()
-                current[0] = queued.pop(0)
-                return [0], [], []
-
-            with patch('touchswitch.wayland.send', side_effect=send_command), patch('time.monotonic', side_effect=lambda: now[0]):
-                helper.own_grab(55, Mock(pidfd=99), send=received,
-                                clock=lambda: now[0], poll=poll,
-                                read=lambda fd, count: current[0], ioctl=ioctl, close=close)
-            if confirm:
-                self.assertGreater(now[0], 16)
-                self.assertEqual(events[-1]['reason'], 'enabled by user')
-                self.assertTrue(window.session_confirmed)
-            else:
-                self.assertEqual(now[0], 15)
-                self.assertEqual(events[-1]['reason'], '15-second trial expired')
-                self.assertFalse(window.session_confirmed)
-            close.assert_called_once_with(55)
-            self.assertIsNone(window.backend.blocked_key)
-            self.assertIn('Not blocked', window.indicator.get_text())
-            return events
-
-        run_once(first=True)
-        if repeat:
-            # A fresh helper still needs KEEP; the GUI sends it without another trial UI.
-            run_once(first=False)
+        self.assertFalse(window.keep.get_visible())
+        self.assertFalse(window.helper_confirmed)
+        window.trial_event({'event': 'kept'})
+        self.assertTrue(window.helper_confirmed)
+        self.assertEqual(window.deadline, 0)

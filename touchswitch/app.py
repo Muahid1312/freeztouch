@@ -195,7 +195,7 @@ class Window(Gtk.Window):
         device = self.selected()
         if not device or self.busy or self.process:
             return
-        trial_required = self.backend.session.kind != 'wayland' or not self.session_confirmed
+        trial_required = self.backend.session.kind != 'wayland'
         if trial_required:
             dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
                                       buttons=Gtk.ButtonsType.OK_CANCEL, text='Try disabling touch for 15 seconds?')
@@ -267,10 +267,13 @@ class Window(Gtk.Window):
             self.deadline = time.monotonic() + event['seconds']
             self.status(False)
             self.keep.set_sensitive(True)
-            if self.backend.session.kind == 'wayland' and self.session_confirmed:
-                # Each new helper still starts safely; cancel its trial immediately
-                # only after this app session's first confirmation was acknowledged.
-                self.request_confirmation()
+            if self.backend.session.kind == 'wayland':
+                if event.get('confirmed') is True:
+                    self.accept_confirmation()
+                else:
+                    # Compatibility with an older installed helper: cancel its
+                    # trial automatically, without requiring a second user action.
+                    self.request_confirmation()
             else:
                 self.keep.show()
                 self.keep.grab_focus()

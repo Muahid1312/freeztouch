@@ -129,7 +129,7 @@ class GrabLifecycle(unittest.TestCase):
     def own(self):
         with patch.object(helper.time, 'monotonic', side_effect=lambda: self.mono):
             helper.own_grab(55, self.guard, self.events.append, clock=lambda: self.now,
-                            poll=self.poller, read=self.read, ioctl=self.ioctl, close=self.close)
+                            poll=self.poller, read=self.read, ioctl=self.ioctl, close=self.close, trial=True)
 
     def assert_released(self):
         self.assertEqual(self.ioctl.call_args_list[-1].args, (55, helper.EVIOCGRAB, 0))
@@ -318,3 +318,30 @@ class VerifiedOpen(unittest.TestCase):
                 with self.assertRaisesRegex(helper.UnsafeDevice, 'Keyboard'):
                     helper.open_verified(token, 'seat0', root)
                 close.assert_called_once_with(55)
+
+
+class PersistentBlocking(unittest.TestCase):
+    def test_default_grab_stays_blocked_beyond_30_seconds_without_keep(self):
+        now = [0.0]
+        command = [b'']
+        events = []
+        ioctl, close = Mock(), Mock()
+        def poll(fds, writes, errors, timeout):
+            now[0] += timeout
+            if now[0] > 30:
+                ioctl.assert_called_once_with(55, helper.EVIOCGRAB, 1)
+                close.assert_not_called()
+                command[0] = b'RELEASE\n'
+            else:
+                command[0] = b'PING\n'
+            return [0], [], []
+        with patch.object(helper.time, 'monotonic', side_effect=lambda: now[0]):
+            helper.own_grab(55, Mock(pidfd=99), send=events.append,
+                            clock=lambda: now[0], poll=poll,
+                            read=lambda fd, size: command[0], ioctl=ioctl, close=close)
+        self.assertGreater(now[0], 30)
+        self.assertTrue(events[0]['confirmed'])
+        self.assertEqual(events[0]['seconds'], 0)
+        self.assertTrue(all(e.get('trial_remaining') is None for e in events))
+        self.assertEqual(events[-1]['reason'], 'enabled by user')
+        close.assert_called_once_with(55)

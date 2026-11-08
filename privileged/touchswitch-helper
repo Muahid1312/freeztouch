@@ -183,7 +183,7 @@ def emit(message):
 
 
 def own_grab(fd, guard, send=emit, clock=boottime, poll=select.select,
-             read=os.read, ioctl=fcntl.ioctl, close=os.close):
+             read=os.read, ioctl=fcntl.ioctl, close=os.close, trial=False):
     """Only this function owns the fd. Every path closes it, even a failed grab."""
     grabbed = False
     reason = 'released'
@@ -193,9 +193,10 @@ def own_grab(fd, guard, send=emit, clock=boottime, poll=select.select,
         ioctl(fd, EVIOCGRAB, 1)
         grabbed = True
         now = clock()
-        trial_deadline, heartbeat = now + 15, now + 4
+        trial_deadline, heartbeat = now + 15 if trial else None, now + 4
         previous_boot, previous_mono = now, time.monotonic()
-        send({'event': 'disabled', 'seconds': 15, 'trial_remaining': 15, 'confirmed': False})
+        send({'event': 'disabled', 'seconds': 15 if trial else 0,
+              'trial_remaining': 15 if trial else None, 'confirmed': not trial})
         pending = b''
         while True:
             now, mono = clock(), time.monotonic()

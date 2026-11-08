@@ -1,6 +1,6 @@
 # TouchSwitch
 
-A compact GTK application that temporarily blocks touchscreen input on Ubuntu Wayland, or changes a verified touchscreen's enabled property on X11. The GUI always runs as your normal user. It includes a device selector, keyboard-accessible controls, and a protected 15-second trial.
+A compact GTK application that temporarily blocks touchscreen input on Ubuntu Wayland, or changes a verified touchscreen's enabled property on X11. The GUI always runs as your normal user. It includes a device selector, keyboard-accessible controls, and automatic recovery if its GUI connection is lost.
 
 ## Install and launch on Ubuntu 26.04
 
@@ -47,11 +47,11 @@ Select your touchscreen, for example **Wacom HID 48CA Finger**. TouchSwitch disc
 
 Multiple dedicated touchscreens appear in the selector. This version holds one Wayland grab at a time; enable the selected panel before selecting another. No mouse, keyboard, or touchpad is intentionally grabbed.
 
-The first disable starts a **15-second helper-side trial**. Choose **Keep touchscreen disabled** using a mouse or keyboard before its countdown reaches zero; touch confirmation is rejected. The GUI waits for the helper to acknowledge cancellation of its `CLOCK_BOOTTIME` trial deadline before showing confirmed blocking and clearing the countdown. If you do not confirm, touch returns automatically. After that acknowledgement, later Wayland disables in the same app session are automatically confirmed without another trial prompt or button. Restarting the app resets this session preference. Heartbeat, connection, process and desktop-session recovery remain active even after confirmation.
+On Wayland, **Disable touchscreen blocks touch until you click Enable touchscreen or close the app**. There is no 15-second cutoff or Keep button. The root helper starts directly in persistent blocking mode, and the GUI shows that state only after helper acknowledgement. If an older installed helper starts a trial, the GUI automatically sends `KEEP` to cancel it; reinstall the updated helper to remove that startup timer completely. Heartbeat, connection, process and desktop-session recovery remain active.
 
 Touch is released on Enable, GUI exit/crash, EOF on its private control pipe, lost GUI heartbeat (at most four seconds), helper termination, or the desktop session ending/becoming inactive. A pinned GUI pidfd and logind session checks provide independent recovery. Normal termination explicitly ungrabs and closes; even SIGKILL causes the kernel to close the descriptor and release the grab. Failed grabs, including `EBUSY`, never report blocked status.
 
-On disconnect, the helper closes the fd and reports the error. On suspend/resume it releases as soon as execution resumes, using boottime/monotonic divergence or heartbeat expiry, and **does not automatically re-grab**. Refresh and authorize another disable if needed (with a trial if this app session has not yet confirmed one). Device failures, a stalled kernel, or a powered-off/suspended machine cannot be fixed by a GUI timer. Closing the app releases even a confirmed Wayland block.
+On disconnect, the helper closes the fd and reports the error. On suspend/resume it releases as soon as execution resumes, using boottime/monotonic divergence or heartbeat expiry, and **does not automatically re-grab**. Refresh and authorize another disable if needed. Device failures, a stalled kernel, or a powered-off/suspended machine cannot be fixed by a GUI timer. Closing the app releases even a confirmed Wayland block.
 
 Use **Tab / Shift+Tab**, selector arrow keys, and **Space / Enter**. **Alt+T** selects the device; **Alt+E** enables/releases; **Alt+D** starts a trial; **Alt+K** keeps it blocked; **Alt+R** refreshes. Keep a working physical mouse or keyboard available for your first real-device trial.
 
